@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Mini Dash</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #0b0b1a;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: pointer;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W = 0, H = 0, groundY = 0;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  groundY = Math.round(H * 0.78);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const GRAV = 2600;
+const JUMP_V = 900;
+const SIZE = 32;
+const PLAYER_X = 120;
+const BASE_SPEED = 380;
+const MAX_SPEED = 740;
+
+const game = {
+  mode: 'ready',
+  time: 0,
+  dist: 0,
+  speed: BASE_SPEED,
+  score: 0,
+  best: parseInt(localStorage.getItem('minidash_best') || '0', 10) || 0,
+};
+
+const player = { y: groundY - SIZE, vy: 0, angle: 0, grounded: true };
+
+let obstacles = [];
+let particles = [];
+let nextSpawn = 900;
+let shake = 0;
+let muted = false;
+
+const deco = [];
+for (let i = 0; i < 36; i++) {
+  deco.push({
+    x: Math.random() * 2400,
+    y: Math.random(),
+    s: 18 + Math.random() * 90,
+    p: 0.15 + Math.random() * 0.45,
+  });
+}
+
+let audioCtx = null;
+function beep(freqA, freqB, dur, type, vol) {
+  if (muted) return;
+  try {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const t = audioCtx.currentTime;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freqA, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1, freqB), t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start(t);
+    o.stop(t + dur);
+  } catch (e) { /* audio unavailable */ }
+}
+
+function snapAngle() {
+  player.angle = Math.round(player.angle / (Math.PI / 2)) * (Math.PI / 2);
+}
+
+function spawnDust() {
+  for (let i = 0; i < 8; i++) {
+    particles.push({
+      x: PLAYER_X + SIZE / 2 + (Math.random() - 0.5) * SIZE,
+      y: player.y + SIZE - 2,
+      vx: -60 - Math.random() * 120,
+      vy: -40 - Math.random() * 90,
+      size: 3 + Math.random() * 4,
+      life: 0.3 + Math.random() * 0.25,
+      t: 0,
+      color: 'rgba(148,163,184,0.8)',
+    });
+  }
+}
+
+function die() {
+  game.mode = 'dead';
+  shake = 16;
+  beep(240, 28, 0.5, 'sawtooth', 0.12);
+  for (let i = 0; i < 28; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = 120 + Math.random() * 340;
+    particles.push({
+      x: PLAYER_X + SIZE / 2,
+      y: player.y + SIZE / 2,
+      vx: Math.cos(a) * s,
+      vy: Math.sin(a) * s - 140,
+      size: 4 + Math.random() * 8,
+      life: 0.7 + Math.random() * 0.6,
+      t: 0,
+      color: i % 3 === 0 ? '#f472b6' : '#22d3ee',
+    });
+  }
+}
+
+function reset() {
+  game.time = 0;
+  game.dist = 0;
+  game.speed = BASE_SPEED;
+  game.score = 0;
+  obstacles = [];
+  particles = [];
+  nextSpawn = 900;
+  shake = 0;
+  player.y = groundY - SIZE;
+  player.vy = 0;
+  player.angle = 0;
+  player.grounded = true;
+}
+
+function spawnObstacle() {
+  const sp = game.speed / BASE_SPEED;
+  const roll = Math.random();
+  let width;
+  if (roll < 0.55) {
+    const n = (roll < 0.16 && sp > 1.15) ? 2 : 1;
+    width = 34 * n;
+    obstacles.push({ type: 'spike', x: nextSpawn, w: width, h: 40, base: groundY });
+  } else {
+    const h = Math.random() < 0.5 ? 34 : 68;
+    width = 34;
+    obstacles.push({ type: 'block', x: nextSpawn, w: 34, h, base: groundY });
+    if (sp > 1.1 && Math.random() < 0.3) {
+      obstacles.push({ type: 'spike', x: nextSpawn, w: 34, h: 40, base: groundY - h });
+    }
+  }
+  const gap = 240 + Math.random() * 200 + (sp - 1) * 120;
+  nextSpawn += width + gap;
+}
+
+function updateParticles(dt) {
+  for (const p of particles) {
+    p.t += dt;
+    p.vy += 1400 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+  }
+  particles = particles.filter(p => p.t < p.life);
+}
+
+function update(dt) {
+  updateParticles(dt);
+  if (game.mode !== 'playing') return;
+
+  game.time += dt;
+  game.speed = Math.min(BASE_SPEED + game.time * 6, MAX_SPEED);
+  game.dist += game.speed * dt;
+  game.score = Math.floor(game.dist / 40);
+  if (game.score > game.best) {
+    game.best = game.score;
+    localStorage.setItem('minidash_best', String(game.best));
+  }
+
+  while (nextSpawn < game.dist + W + 120) spawnObstacle();
+  obstacles = obstacles.filter(o => o.x + o.w > game.dist - 120);
+
+  if ((game.time * 60 | 0) % 2 === 0) {
+    particles.push({
+      x: PLAYER_X + 2,
+      y: player.y + SIZE / 2 + (Math.random() - 0.5) * SIZE,
+      vx: -game.speed * 0.25,
+      vy: (Math.random() - 0.5) * 40,
+      size: 3 + Math.random() * 4,
+      life: 0.35,
+      t: 0,
+      color: 'rgba(34,211,238,0.7)',
+    });
+  }
+
+  const prevBottom = player.y + SIZE;
+  player.vy += GRAV * dt;
+  player.y += player.vy * dt;
+  if (!player.grounded) player.angle += 6.8 * dt;
+
+  const px = game.dist + PLAYER_X;
+  const pcx = px + SIZE / 2;
+
+  let floor = groundY;
+  for (const o of obstacles) {
+    if (o.type === 'block' && pcx > o.x && pcx < o.x + o.w) {
+      floor = Math.min(floor, o.base - o.h);
+    }
+  }
+
+  if (player.vy >= 0 && player.y + SIZE >= floor) {
+    if (!player.grounded) {
+      snapAngle();
+      spawnDust();
+      beep(170, 90, 0.06, 'triangle', 0.05);
+    }
+    player.y = floor - SIZE;
+    player.vy = 0;
+    player.grounded = true;
+  } else if (player.y + SIZE < floor - 1) {
+    player.grounded = false;
+  }
+
+  const pL = px + 5, pR = px + SIZE - 5;
+  const pT = player.y + 5, pB = player.y + SIZE - 5;
+  for (const o of obstacles) {
+    if (o.type === 'spike') {
+      const hx = o.x + o.w * 0.22;
+      const hw = o.w * 0.56;
+      const hTop = o.base - o.h * 0.55;
+      if (pR > hx && pL < hx + hw && pB > hTop && pT < o.base) {
+        die();
+        return;
+      }
+    } else {
+      const top = o.base - o.h;
+      if (pR > o.x + 2 && pL < o.x + o.w - 2 && pB > top + 2 && pT < o.base - 2) {
+        if (player.vy >= 0 && prevBottom <= top + 12) {
+          player.y = top - SIZE;
+          player.vy = 0;
+          if (!player.grounded) {
+            snapAngle();
+            spawnDust();
+          }
+          player.grounded = true;
+        } else {
+          die();
+          return;
+        }
+      }
+    }
+  }
+}
+
+function jump() {
+  if (game.mode === 'ready') {
+    game.mode = 'playing';
+  } else if (game.mode === 'dead') {
+    reset();
+    game.mode = 'playing';
+  }
+  if (player.grounded) {
+    player.vy = -JUMP_V;
+    player.grounded = false;
+    beep(280, 520, 0.09, 'square', 0.08);
+    spawnDust();
+  }
+}
+
+function onKey(e) {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+    e.preventDefault();
+    jump();
+  } else if (e.code === 'KeyM') {
+    muted = !muted;
+  }
+}
+window.addEventListener('keydown', onKey);
+window.addEventListener('mousedown', jump);
+window.addEventListener('touchstart', (e) => { e.preventDefault(); jump(); }, { passive: false });
+
+function centerMsg(text, size, y, color) {
+  ctx.font = 'bold ' + size + 'px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = color || '#ffffff';
+  ctx.fillText(text, W / 2, y);
+}
+
+function render() {
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0b1030');
+  grad.addColorStop(1, '#1b0b2e');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  if (shake > 0) {
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    shake *= 0.88;
+    if (shake < 0.4) shake = 0;
+  }
+
+  ctx.strokeStyle = 'rgba(130,130,255,0.09)';
+  ctx.lineWidth = 1;
+  for (const d of deco) {
+    const span = W + 240;
+    const sx = (((d.x - game.dist * d.p) % span) + span) % span - 120;
+    ctx.strokeRect(sx, d.y * groundY * 0.92, d.s, d.s);
+  }
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  const grid = 60;
+  const off = -(game.dist % grid);
+  ctx.beginPath();
+  for (let x = off; x < W; x += grid) { ctx.moveTo(x, groundY); ctx.lineTo(x, H); }
+  for (let y = groundY + grid; y < H; y += grid) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  ctx.fillStyle = '#0e0e22';
+  ctx.fillRect(0, groundY, W, H - groundY);
+  ctx.strokeStyle = '#22d3ee';
+  ctx.lineWidth = 3;
+  ctx.shadowColor = '#22d3ee';
+  ctx.shadowBlur = 14;
+  ctx.beginPath();
+  ctx.moveTo(0, groundY);
+  ctx.lineTo(W, groundY);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  for (const o of obstacles) {
+    const sx = o.x - game.dist;
+    if (sx > W + 80 || sx + o.w < -80) continue;
+    if (o.type === 'spike') {
+      ctx.fillStyle = '#f472b6';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      const n = Math.max(1, Math.round(o.w / 34));
+      for (let i = 0; i < n; i++) {
+        const x0 = sx + (o.w / n) * i;
+        const step = o.w / n;
+        ctx.beginPath();
+        ctx.moveTo(x0, o.base);
+        ctx.lineTo(x0 + step / 2, o.base - o.h);
+        ctx.lineTo(x0 + step, o.base);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
+    } else {
+      ctx.fillStyle = '#1e293b';
+      ctx.strokeStyle = '#a78bfa';
+      ctx.lineWidth = 2;
+      ctx.fillRect(sx, o.base - o.h, o.w, o.h);
+      ctx.strokeRect(sx, o.base - o.h, o.w, o.h);
+    }
+  }
+
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, 1 - p.t / p.life);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  if (game.mode !== 'dead') {
+    ctx.save();
+    ctx.translate(PLAYER_X + SIZE / 2, player.y + SIZE / 2);
+    ctx.rotate(player.angle);
+    ctx.fillStyle = '#22d3ee';
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2.5;
+    ctx.shadowColor = '#22d3ee';
+    ctx.shadowBlur = 16;
+    ctx.fillRect(-SIZE / 2, -SIZE / 2, SIZE, SIZE);
+    ctx.shadowBlur = 0;
+    ctx.strokeRect(-SIZE / 2, -SIZE / 2, SIZE, SIZE);
+    ctx.fillStyle = '#0b0b1a';
+    ctx.fillRect(-SIZE / 4, -SIZE / 4, SIZE / 2, SIZE / 2);
+    ctx.restore();
+  }
+  ctx.restore();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 30px system-ui, sans-serif';
+  ctx.fillText(String(game.score), W / 2, 54);
+  ctx.textAlign = 'left';
+  ctx.font = '14px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.fillText('BEST ' + game.best, 16, 28);
+  ctx.textAlign = 'right';
+  ctx.fillText('M: sound ' + (muted ? 'off' : 'on'), W - 16, 28);
+
+  if (game.mode === 'ready') {
+    centerMsg('MINI DASH', 44, H * 0.3);
+    centerMsg('Press SPACE / CLICK / TAP to jump', 18, H * 0.3 + 42);
+    centerMsg('Dodge the spikes, land on the blocks', 14, H * 0.3 + 70, 'rgba(255,255,255,0.6)');
+  } else if (game.mode === 'dead') {
+    centerMsg('GAME OVER', 44, H * 0.3, '#f472b6');
+    centerMsg('Score ' + game.score + '   Best ' + game.best, 18, H * 0.3 + 44);
+    centerMsg('Press SPACE / CLICK / TAP to retry', 15, H * 0.3 + 76, 'rgba(255,255,255,0.7)');
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 1 / 30) dt = 1 / 30;
+  if (dt < 0) dt = 0;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
